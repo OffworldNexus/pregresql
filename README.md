@@ -7,8 +7,8 @@ A mostly-transparent proxy for the PostgreSQL frontend/backend protocol, written
 in pure Rust, with two hooks:
 
 * **an authentication hook** — the proxy observes the inbound connection (Unix
-  peer credentials, the startup packet, TLS state, and the credentials the
-  client presented) and the hook returns the *actual* upstream target to
+  peer credentials, the tag of the listener that accepted it, the startup
+  packet, TLS state, and the credentials the client presented) and the hook returns the *actual* upstream target to
   connect to (network location, TLS, role, password, database);
 * **a query hook** — every statement the client tries to run goes through the
   hook, which may allow it, rewrite it, or reject it with a synthetic
@@ -51,6 +51,10 @@ Unix-like operating system (Linux, or BSD/macOS). The proxy speaks the protocol
 over TCP *and* over Unix-domain sockets, and reads peer credentials through
 `SO_PEERCRED` (Linux) or `getpeereid` (BSD/macOS); `tokio`'s Unix-socket types
 are not available on Windows. CI therefore runs on Linux and macOS.
+
+On Linux (and Android) the proxy additionally collects the `SCM_CREDENTIALS`
+of the client's first message (see *Listener tags and Unix credentials*); on
+other platforms that field is always `None`.
 
 Rust 1.88 or newer (the floor is set by the resolved dependency graph; it is
 checked in CI).
@@ -124,8 +128,9 @@ challenge/response exchange instead of trusting whatever the client claims:
 1. `client_auth_method(&InboundConnection) -> ClientAuthMethod` decides how the
    client proves itself: `Trust`, `Cleartext`, `Md5` or `ScramSha256`.
    `InboundConnection` carries the transport (including `SO_PEERCRED` uid/gid/pid
-   for Unix sockets), the TLS state and the client certificate, and the full
-   startup packet.
+   and the `SCM_CREDENTIALS` of the first message for Unix sockets), the tag of
+   the listener that accepted the connection, the TLS state and the client
+   certificate, and the full startup packet.
 2. `password_for_user(...)` supplies the expected password so the proxy can
    *verify* the proof. For `ScramSha256` the proxy acts as a genuine SCRAM
    server, so it learns nothing from the wire and only trusts the password the
@@ -144,6 +149,62 @@ database to request, and extra startup parameters that override the client's.
 A failed `resolve_upstream` closes the connection with a `FATAL` `ErrorResponse`
 carrying the hook's SQLSTATE.
 
+### Listener tags and Unix credentials
+
+Besides the addresses in `ProxyConfig::listen`, which the proxy binds itself,
+an embedding application can hand the proxy listeners it bound on its own —
+typically inherited from a privileged parent process across `execve` — each
+with an opaque tag:
+
+```rust,ignore
+use std::os::fd::FromRawFd;
+
+let mut proxy = Proxy::new(config, auth, policy)?;
+// SAFETY: fd 3 is a listening Unix socket handed down by the parent.
+let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
+proxy.add_unix_listener(listener, "view-42");
+proxy.add_tcp_listener(std::net::TcpListener::bind("127.0.0.1:0")?, "local-tcp");
+proxy.run().await
+```
+
+Adopted listeners may be in blocking mode (the proxy switches them to
+non-blocking when it starts), are served alongside the configured ones, and
+their socket files are never unlinked. Every connection they accept exposes the
+tag as `InboundConnection::listener_tag` (`None` for configured listeners), to
+both hooks: `QueryContext::connection` is the same `InboundConnection` the auth
+hook saw, so a query policy can key off the tag or the credentials without
+keeping its own `connection_id` map.
+
+Tags are the robust way to identify a local client: give each client identity
+its own Unix socket, readable and writable only by that identity (for example
+mode `0600` owned by the client's uid), and the kernel's permission check at
+`connect()` decides which tag a client can reach.
+
+For Unix sockets the proxy also records two kinds of peer credentials in
+`Transport::Unix`:
+
+* `peer_pid`/`peer_uid`/`peer_gid` (`Transport::peer_uid()`): `SO_PEERCRED` on
+  Linux, `getpeereid` on BSD/macOS (no pid there). **These are wrong under
+  gVisor** — on DigitalOcean App Platform, for example, `SO_PEERCRED` on an
+  accepted socket returns the *listening* process's pid/uid/gid for every
+  connection, whatever the client.
+* `message_credentials` (`Transport::message_credentials()`,
+  `Transport::message_uid()`), Linux and Android only: the proxy sets
+  `SO_PASSCRED` on every Unix listener it serves and on each accepted socket,
+  and performs the connection's first read with `recvmsg`, so the kernel hands
+  it the `SCM_CREDENTIALS` (pid, uid, gid) of the process that wrote the first
+  bytes. Clients need nothing special — an unmodified libpq works — and a
+  client can only claim other credentials if it holds `CAP_SYS_ADMIN` /
+  `CAP_SETUID` / `CAP_SETGID` (an unprivileged client claiming uid 0 gets
+  `EPERM`). This works correctly under gVisor. It is `None` on other platforms,
+  for TCP, or when `SO_PASSCRED` could not be enabled.
+
+The `recvmsg` reads into the same buffer the startup negotiation decodes from,
+and reads exactly what an ordinary read would, so it is transparent to the
+protocol: the first bytes may be an `SSLRequest`, part of a startup packet, or a
+`CancelRequest`, and data the client wrote before the proxy even accepted the
+connection is covered too.
+
 ### The query hook
 
 `QueryHook::authorize` is called before the proxy forwards a statement, with a
@@ -154,7 +215,9 @@ carrying the hook's SQLSTATE.
 * `sql`, `statement_name`, `portal_name`, `parameters`;
 * `statement_known` — false when the client refers to a prepared statement the
   proxy never authorised;
-* `connection_id`, `user` (to the proxy), `upstream_user`, `transaction_status`.
+* `connection` (the full `InboundConnection`, including the listener tag and
+  peer credentials), `connection_id`, `user` (to the proxy), `upstream_user`,
+  `transaction_status`.
 
 The decision is `Allow`, `Rewrite(sql)` (for `Query`/`Parse`) or
 `Deny { sqlstate, message }`.
@@ -280,6 +343,10 @@ two hooks. Where behaviour is observable, it reproduces the backend's:
   handed the client, and a request for a minor protocol version the proxy does
   not implement is answered with `NegotiateProtocolVersion` listing unknown
   `_pq_.*` options, exactly as a backend would.
+* **Unix credentials.** Reading `SCM_CREDENTIALS` changes nothing on the wire:
+  the first read is a `recvmsg` that returns exactly the bytes a plain read
+  would, into the same buffer. Descriptors a client might pass with
+  `SCM_RIGHTS` in its first message are closed immediately.
 * **Identity.** The client is given the proxy's own `BackendKeyData`, so
   cancellation has to be re-issued against the upstream connection; the
   upstream's `ParameterStatus` messages are forwarded verbatim.
@@ -330,7 +397,11 @@ $ ./scripts/validate.sh               # the docker end-to-end validation
 Unit tests cover framing (including truncated prefixes), startup packet
 round-trips, MD5 composition, the SCRAM client/server exchange in both
 directions against the published RFC 7677 test vector, error-field encoding, and
-the output-ordering rules for rejections.
+the output-ordering rules for rejections. `tests/listeners.rs` runs the proxy
+over real sockets to cover adopted listeners and their tags (Unix and TCP),
+`SCM_CREDENTIALS` (including a startup packet written before the proxy
+accepted, and an `SSLRequest` followed by a fragmented startup packet), early
+disconnects, and the connection details the query hook receives.
 
 ## Continuous integration
 

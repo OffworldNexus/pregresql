@@ -1,5 +1,5 @@
-//! Listener plumbing: bind sockets, accept connections, negotiate the startup
-//! phase (including TLS) and hand the connection to a [`Session`].
+//! Listener plumbing: bind (or adopt) sockets, accept connections, negotiate
+//! the startup phase (including TLS) and hand the connection to a [`Session`].
 
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -21,6 +21,12 @@ use crate::proxy::hooks::{AuthHook, QueryHook, TlsInfo, Transport};
 use crate::proxy::session::Session;
 use crate::proxy::stream::{unix_peer_cred, BoxedStream, RawStream};
 
+/// A listener bound by the embedding application and handed to the proxy.
+enum AdoptedListener {
+    Unix(std::os::unix::net::UnixListener, Arc<str>),
+    Tcp(std::net::TcpListener, Arc<str>),
+}
+
 /// The first packet of a connection, once any TLS negotiation is finished.
 enum FirstPacket {
     Startup(crate::protocol::startup::StartupParams),
@@ -37,6 +43,7 @@ pub struct Proxy {
     next_connection: AtomicU64,
     next_pid: AtomicI32,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    adopted: Vec<AdoptedListener>,
 }
 
 impl std::fmt::Debug for Proxy {
@@ -44,6 +51,7 @@ impl std::fmt::Debug for Proxy {
         f.debug_struct("Proxy")
             .field("listen", &self.config.listen)
             .field("tls", &self.tls_acceptor.is_some())
+            .field("adopted_listeners", &self.adopted.len())
             .finish_non_exhaustive()
     }
 }
@@ -83,7 +91,48 @@ impl Proxy {
             next_connection: AtomicU64::new(1),
             next_pid: AtomicI32::new(1_000_000),
             semaphore,
+            adopted: Vec::new(),
         })
+    }
+
+    /// Serve an already-bound Unix-domain socket listener, alongside the
+    /// addresses in [`ProxyConfig::listen`].
+    ///
+    /// Every connection it accepts carries `tag` in
+    /// [`InboundConnection::listener_tag`](crate::proxy::InboundConnection::listener_tag),
+    /// so hooks can tell the listeners apart. A typical use is one listener
+    /// per client identity, each protected by file permissions — the kernel
+    /// then enforces who may `connect()` to which tag. The listener is
+    /// typically inherited from a parent process (via
+    /// [`FromRawFd`](std::os::fd::FromRawFd)); it may be in blocking mode, the
+    /// proxy switches it to non-blocking when it starts serving.
+    ///
+    /// The proxy never unlinks the socket file of an adopted listener. On
+    /// Linux and Android it enables `SO_PASSCRED` on it, see
+    /// [`Transport::message_credentials`].
+    pub fn add_unix_listener(
+        &mut self,
+        listener: std::os::unix::net::UnixListener,
+        tag: impl Into<String>,
+    ) -> &mut Self {
+        let tag: String = tag.into();
+        self.adopted
+            .push(AdoptedListener::Unix(listener, Arc::from(tag)));
+        self
+    }
+
+    /// Serve an already-bound TCP listener, alongside the addresses in
+    /// [`ProxyConfig::listen`]. See [`Proxy::add_unix_listener`] for the role
+    /// of `tag`.
+    pub fn add_tcp_listener(
+        &mut self,
+        listener: std::net::TcpListener,
+        tag: impl Into<String>,
+    ) -> &mut Self {
+        let tag: String = tag.into();
+        self.adopted
+            .push(AdoptedListener::Tcp(listener, Arc::from(tag)));
+        self
     }
 
     /// The cancellation registry (mostly useful for tests).
@@ -92,7 +141,12 @@ impl Proxy {
     }
 
     /// Serve until `shutdown` resolves.
-    pub async fn run_until<F: Future<Output = ()>>(self, shutdown: F) -> Result<()> {
+    ///
+    /// Binds every address in [`ProxyConfig::listen`] and serves those plus
+    /// the listeners added with [`Proxy::add_unix_listener`] and
+    /// [`Proxy::add_tcp_listener`].
+    pub async fn run_until<F: Future<Output = ()>>(mut self, shutdown: F) -> Result<()> {
+        let adopted = std::mem::take(&mut self.adopted);
         let proxy = Arc::new(self);
         let mut listeners = Vec::new();
 
@@ -104,7 +158,9 @@ impl Proxy {
                     })?;
                     tracing::info!(%addr, "listening for PostgreSQL clients over TCP");
                     let proxy = Arc::clone(&proxy);
-                    listeners.push(tokio::spawn(async move { proxy.serve_tcp(listener).await }));
+                    listeners.push(tokio::spawn(async move {
+                        proxy.serve_tcp(listener, None).await
+                    }));
                 }
                 ListenAddr::Unix(path) => {
                     if proxy.config.replace_unix_socket {
@@ -124,9 +180,52 @@ impl Proxy {
                     })?;
                     tracing::info!(path = %path.display(), "listening for PostgreSQL clients over a Unix socket");
                     let proxy = Arc::clone(&proxy);
-                    listeners.push(tokio::spawn(
-                        async move { proxy.serve_unix(listener).await },
-                    ));
+                    listeners.push(tokio::spawn(async move {
+                        proxy.serve_unix(listener, None).await
+                    }));
+                }
+            }
+        }
+
+        for adopted in adopted {
+            match adopted {
+                AdoptedListener::Tcp(listener, tag) => {
+                    let listener = listener
+                        .set_nonblocking(true)
+                        .and_then(|()| TcpListener::from_std(listener))
+                        .map_err(|e| {
+                            Error::other(format!("cannot adopt tcp listener {tag:?}: {e}"))
+                        })?;
+                    match listener.local_addr() {
+                        Ok(addr) => {
+                            tracing::info!(%addr, tag = %tag, "listening for PostgreSQL clients over an adopted TCP listener")
+                        }
+                        Err(_) => {
+                            tracing::info!(tag = %tag, "listening for PostgreSQL clients over an adopted TCP listener")
+                        }
+                    }
+                    let proxy = Arc::clone(&proxy);
+                    listeners.push(tokio::spawn(async move {
+                        proxy.serve_tcp(listener, Some(tag)).await
+                    }));
+                }
+                AdoptedListener::Unix(listener, tag) => {
+                    let listener = listener
+                        .set_nonblocking(true)
+                        .and_then(|()| UnixListener::from_std(listener))
+                        .map_err(|e| {
+                            Error::other(format!("cannot adopt unix listener {tag:?}: {e}"))
+                        })?;
+                    let path = listener
+                        .local_addr()
+                        .ok()
+                        .and_then(|addr| addr.as_pathname().map(|p| p.display().to_string()))
+                        .unwrap_or_default();
+                    tracing::info!(path = %path, tag = %tag, "listening for PostgreSQL clients over an adopted Unix socket");
+                    let proxy = Arc::clone(&proxy);
+                    listeners.push(tokio::spawn(async move {
+                        proxy.serve_unix(listener, Some(tag)).await
+                    }));
                 }
             }
         }
@@ -155,7 +254,11 @@ impl Proxy {
         }
     }
 
-    async fn serve_tcp(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+    async fn serve_tcp(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tag: Option<Arc<str>>,
+    ) -> Result<()> {
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(v) => v,
@@ -172,14 +275,28 @@ impl Proxy {
             let permit = self.acquire_slot().await;
             let transport = Transport::Tcp { peer, local };
             let proxy = Arc::clone(&self);
+            let tag = tag.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                proxy.serve(RawStream::Tcp(stream), transport).await;
+                let buf = BytesMut::with_capacity(16 * 1024);
+                proxy
+                    .serve(RawStream::Tcp(stream), transport, tag, buf)
+                    .await;
             });
         }
     }
 
-    async fn serve_unix(self: Arc<Self>, listener: UnixListener) -> Result<()> {
+    async fn serve_unix(
+        self: Arc<Self>,
+        listener: UnixListener,
+        tag: Option<Arc<str>>,
+    ) -> Result<()> {
+        // Accepted sockets inherit SO_PASSCRED from the listener on Linux, so
+        // data a client writes before it is even accepted carries credentials.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Err(e) = crate::proxy::stream::set_passcred(&listener) {
+            tracing::debug!(error = %e, "cannot enable SO_PASSCRED on the unix listener");
+        }
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -194,28 +311,48 @@ impl Proxy {
             };
             let cred = unix_peer_cred(&stream);
             let permit = self.acquire_slot().await;
-            let transport = Transport::Unix {
-                path: path.unwrap_or_default(),
-                peer_pid: cred.map(|c| c.0),
-                peer_uid: cred.map(|c| c.1),
-                peer_gid: cred.map(|c| c.2),
-            };
             let proxy = Arc::clone(&self);
+            let tag = tag.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                proxy.serve(RawStream::Unix(stream), transport).await;
+                let mut buf = BytesMut::with_capacity(16 * 1024);
+                let message_credentials = match first_unix_read(&stream, &mut buf).await {
+                    Ok(credentials) => credentials,
+                    Err(e) => {
+                        if !e.is_disconnect() {
+                            tracing::debug!(error = %e, "first read from unix client failed");
+                        }
+                        return;
+                    }
+                };
+                let transport = Transport::Unix {
+                    path: path.unwrap_or_default(),
+                    peer_pid: cred.map(|c| c.0),
+                    peer_uid: cred.map(|c| c.1),
+                    peer_gid: cred.map(|c| c.2),
+                    message_credentials,
+                };
+                proxy
+                    .serve(RawStream::Unix(stream), transport, tag, buf)
+                    .await;
             });
         }
     }
 
-    async fn serve(self: Arc<Self>, raw: RawStream, transport: Transport) {
+    /// Serve one accepted connection. `buf` holds any bytes already read from
+    /// the client (see [`first_unix_read`]).
+    async fn serve(
+        self: Arc<Self>,
+        raw: RawStream,
+        transport: Transport,
+        listener_tag: Option<Arc<str>>,
+        mut buf: BytesMut,
+    ) {
         let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
         let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
         let mut secret_bytes = [0u8; 4];
         rand::thread_rng().fill(&mut secret_bytes);
         let secret = i32::from_ne_bytes(secret_bytes);
-
-        let mut buf = BytesMut::with_capacity(16 * 1024);
 
         let (mut client, first, tls) = match self.negotiate(Some(raw), &mut buf).await {
             Ok(v) => v,
@@ -277,6 +414,7 @@ impl Proxy {
             buf,
             startup,
             transport,
+            listener_tag,
             tls,
             Arc::clone(&self.auth),
             Arc::clone(&self.query),
@@ -353,6 +491,35 @@ impl Proxy {
             }
         }
     }
+}
+
+/// Perform the first read of an accepted Unix connection.
+///
+/// On Linux and Android this is a `recvmsg` that also collects the
+/// `SCM_CREDENTIALS` the kernel attached to the client's first message; the data
+/// lands in `buf`, where the startup negotiation decodes it from. Elsewhere this
+/// reads nothing and returns `None`, leaving the first read to the negotiation.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn first_unix_read(
+    stream: &tokio::net::UnixStream,
+    buf: &mut BytesMut,
+) -> Result<Option<crate::proxy::hooks::UnixCredentials>> {
+    // Normally inherited from the listener; set it again in case it was not
+    // (e.g. a listener whose flags could not be changed).
+    if let Err(e) = crate::proxy::stream::set_passcred(stream) {
+        tracing::debug!(error = %e, "cannot enable SO_PASSCRED on the unix connection");
+        return Ok(None);
+    }
+    crate::proxy::stream::read_buf_with_credentials(stream, buf).await
+}
+
+/// See the Linux version: other platforms have no `SCM_CREDENTIALS`.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+async fn first_unix_read(
+    _stream: &tokio::net::UnixStream,
+    _buf: &mut BytesMut,
+) -> Result<Option<crate::proxy::hooks::UnixCredentials>> {
+    Ok(None)
 }
 
 /// Read one startup-phase packet from any reader.

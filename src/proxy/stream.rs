@@ -229,3 +229,135 @@ pub fn expect_empty(buf: &BytesMut, what: &str) -> Result<()> {
         )))
     }
 }
+
+/// Ask the kernel to attach `SCM_CREDENTIALS` to every message received on
+/// `socket` (`SO_PASSCRED`). Works on listening sockets too: on Linux, accepted
+/// sockets inherit the flag from their listener.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn set_passcred(socket: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: `one` is a valid `c_int` option value of the advertised length.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Perform one read from `stream` with `recvmsg`, appending the data to `buf`
+/// and returning the `SCM_CREDENTIALS` the kernel attached to it.
+///
+/// This is meant for the very first read of a connection, on a socket with
+/// `SO_PASSCRED` set (see [`set_passcred`]). It reads whatever is available —
+/// exactly like `read_buf` would — so the caller keeps decoding from `buf` as
+/// if nothing special had happened: no byte is lost or reordered.
+///
+/// Returns [`Error::ConnectionClosed`] when the peer closed the connection
+/// before sending anything. File descriptors the peer may have passed with
+/// `SCM_RIGHTS` are closed immediately.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn read_buf_with_credentials(
+    stream: &UnixStream,
+    buf: &mut BytesMut,
+) -> Result<Option<crate::proxy::hooks::UnixCredentials>> {
+    buf.reserve(16 * 1024);
+    loop {
+        stream.readable().await?;
+        let spare = buf.spare_capacity_mut();
+        let outcome = stream.try_io(tokio::io::Interest::READABLE, || {
+            recvmsg_with_credentials(stream, spare)
+        });
+        match outcome {
+            Ok((0, _)) => return Err(Error::ConnectionClosed),
+            Ok((n, credentials)) => {
+                // SAFETY: the kernel initialised the first `n` spare bytes.
+                unsafe { buf.set_len(buf.len() + n) };
+                return Ok(credentials);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The blocking-free `recvmsg` behind [`read_buf_with_credentials`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn recvmsg_with_credentials(
+    stream: &UnixStream,
+    spare: &mut [std::mem::MaybeUninit<u8>],
+) -> std::io::Result<(usize, Option<crate::proxy::hooks::UnixCredentials>)> {
+    use std::os::fd::AsRawFd;
+
+    // Room for one `ucred` plus a few stray descriptors; `cmsghdr` alignment.
+    #[repr(C, align(8))]
+    struct ControlBuffer([u8; 128]);
+
+    let mut control = ControlBuffer([0; 128]);
+    // SAFETY: CMSG_SPACE only does arithmetic.
+    let needed = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::ucred>() as libc::c_uint) };
+    debug_assert!(needed as usize <= control.0.len());
+
+    let mut iov = libc::iovec {
+        iov_base: spare.as_mut_ptr() as *mut libc::c_void,
+        iov_len: spare.len(),
+    };
+    // SAFETY: an all-zero `msghdr` is a valid empty header.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = control.0.len() as _;
+
+    // SAFETY: `msg` points at a live iovec over writable (if uninitialised)
+    // memory and at a live, aligned control buffer of the advertised sizes.
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut credentials = None;
+    // SAFETY: `msg` was filled in by the kernel; the CMSG_* macros walk the
+    // control buffer within `msg_controllen`, and payloads are read unaligned.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            let header = &*cmsg;
+            let data = libc::CMSG_DATA(cmsg);
+            let payload = (header.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+            if header.cmsg_level == libc::SOL_SOCKET {
+                if header.cmsg_type == libc::SCM_CREDENTIALS
+                    && payload >= std::mem::size_of::<libc::ucred>()
+                {
+                    let cred = std::ptr::read_unaligned(data as *const libc::ucred);
+                    credentials = Some(crate::proxy::hooks::UnixCredentials {
+                        pid: cred.pid,
+                        uid: cred.uid,
+                        gid: cred.gid,
+                    });
+                } else if header.cmsg_type == libc::SCM_RIGHTS {
+                    let count = payload / std::mem::size_of::<libc::c_int>();
+                    for i in 0..count {
+                        let fd = std::ptr::read_unaligned((data as *const libc::c_int).add(i));
+                        libc::close(fd);
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok((n as usize, credentials))
+}

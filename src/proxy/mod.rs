@@ -39,7 +39,7 @@ pub use config::{
 pub use hooks::{
     AllowAllQueries, AuthContext, AuthError, AuthHook, ClientAuthMethod, Endpoint,
     InboundConnection, QueryContext, QueryDecision, QueryHook, QueryKind, TlsInfo, Transport,
-    UpstreamTarget,
+    UnixCredentials, UpstreamTarget,
 };
 pub use server::Proxy;
 pub use stream::{AsyncReadWrite, BoxedStream, RawStream};
