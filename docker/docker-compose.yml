@@ -1,0 +1,183 @@
+# Validation harness: a real PostgreSQL server, the proxy, and the official
+# PostgreSQL regression suite run twice (direct and proxied).
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# The `tester` service runs the suite and writes its results to docker/results.
+
+name: pregresql-validation
+
+x-pgtest: &pgtest
+  build:
+    context: .
+    dockerfile: Dockerfile.pgtest
+  image: pregresql/pgtest:16.15
+
+services:
+  # ---------------------------------------------------------------------------
+  # The real PostgreSQL server the proxy forwards to.
+  # ---------------------------------------------------------------------------
+  upstream:
+    <<: *pgtest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      # Force a real SCRAM exchange in both directions.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--no-locale --auth-host=scram-sha-256"
+      LANG: C
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      # The regression suite writes some files *server side* (COPY TO, lo_export)
+      # under the directory that `pg_regress` substitutes for `:abs_builddir@`,
+      # so the tester and the server must see the same path.
+      - ./results:/results
+    ports:
+      # Published only so `examples/demo_client.rs` can show what the very same
+      # role can do when it bypasses the proxy.
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1 -p 5432"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # ---------------------------------------------------------------------------
+  # The proxy under test, in fully transparent mode (`--allow-all`).
+  # ---------------------------------------------------------------------------
+  proxy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.proxy
+    image: pregresql/proxy:local
+    depends_on:
+      upstream:
+        condition: service_healthy
+    command:
+      - --listen
+      - 0.0.0.0:6432
+      - --client-auth
+      - scram
+      - --allow-user
+      - postgres
+      - --allow-password
+      - postgres
+      - --upstream-host
+      - upstream
+      - --upstream-port
+      - "5432"
+      - --upstream-user
+      - postgres
+      - --upstream-password
+      - postgres
+      - --allow-all
+      - --log
+      - info
+    ports:
+      - "127.0.0.1:16432:6432"
+
+  # ---------------------------------------------------------------------------
+  # The same proxy in locked-down mode: one allowed prepared statement, and
+  # clients authenticate as `app`.
+  # ---------------------------------------------------------------------------
+  proxy-strict:
+    image: pregresql/proxy:local
+    depends_on:
+      upstream:
+        condition: service_healthy
+    command:
+      - --listen
+      - 0.0.0.0:6433
+      - --client-auth
+      - scram
+      - --allow-user
+      - app
+      - --allow-password
+      - hunter2
+      - --upstream-host
+      - upstream
+      - --upstream-port
+      - "5432"
+      - --upstream-user
+      - postgres
+      - --upstream-password
+      - postgres
+      - --upstream-database
+      - appdb
+      - --allow-statement
+      - SELECT id, name FROM items WHERE id = $1
+      - --allow-transaction-control
+      - --log
+      - info
+    ports:
+      - "127.0.0.1:16433:6433"
+
+  # ---------------------------------------------------------------------------
+  # The same proxy, but with TLS in both directions: TLS served to the client
+  # and TLS required towards the upstream server (whose self-signed certificate
+  # is accepted without verification for the purposes of the test).
+  # ---------------------------------------------------------------------------
+  proxy-tls:
+    image: pregresql/proxy:local
+    depends_on:
+      upstream:
+        condition: service_healthy
+    command:
+      - --listen
+      - 0.0.0.0:6434
+      - --tls-cert
+      - /etc/pregresql/server.crt
+      - --tls-key
+      - /etc/pregresql/server.key
+      - --client-auth
+      - scram
+      - --allow-user
+      - postgres
+      - --allow-password
+      - postgres
+      - --upstream-host
+      - upstream
+      - --upstream-port
+      - "5432"
+      - --upstream-user
+      - postgres
+      - --upstream-password
+      - postgres
+      - --upstream-tls
+      - require
+      - --upstream-tls-no-verify
+      - --allow-all
+      - --log
+      - info
+    ports:
+      - "127.0.0.1:16434:6434"
+
+  # ---------------------------------------------------------------------------
+  # The official regression suite, run twice through `run-regress.sh`.
+  # ---------------------------------------------------------------------------
+  tester:
+    <<: *pgtest
+    depends_on:
+      upstream:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+    # Run as the same numeric uid as the server process (the `postgres` user,
+    # uid 999 in this image). The regression suite writes some files
+    # server-side under `:abs_builddir`, which both containers share, so that
+    # directory has to be creatable by the server's uid.
+    user: "999:999"
+    entrypoint: ["/usr/local/bin/run-regress.sh"]
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      BASELINE_HOST: upstream
+      BASELINE_PORT: "5432"
+      PROXIED_HOST: proxy
+      PROXIED_PORT: "6432"
+      RESULTS: /results
+      MAX_CONCURRENT_TESTS: "20"
+      MAX_CONNECTIONS: "20"
+    volumes:
+      - ./results:/results

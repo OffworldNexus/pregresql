@@ -1,0 +1,45 @@
+# A PostgreSQL 16 image that also carries the official regression suite and its
+# C support library. The very same image is used as the upstream server and as
+# the test driver, so both containers see `/pgtest-regress` at an identical
+# path (which `pg_regress` substitutes into `PG_LIBDIR`).
+FROM postgres:16.15
+
+ARG PG_VERSION=16.15
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        postgresql-server-dev-16 \
+        gcc \
+        libc6-dev \
+        ca-certificates \
+        bzip2 \
+        openssl \
+        curl \
+        xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# Fetch the regression suite for the exact server version we run and build the
+# `regress.so` support library it loads.
+RUN set -eux; \
+    curl -fsSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" \
+        -o /tmp/pg.tar.bz2; \
+    mkdir -p /tmp/pgsrc; \
+    tar -xjf /tmp/pg.tar.bz2 -C /tmp/pgsrc; \
+    mv "/tmp/pgsrc/postgresql-${PG_VERSION}/src/test/regress" /pgtest-regress; \
+    rm -rf /tmp/pgsrc /tmp/pg.tar.bz2; \
+    gcc -shared -fPIC -O2 \
+        -I"$(pg_config --includedir-server)" \
+        -o /pgtest-regress/regress.so \
+        /pgtest-regress/regress.c; \
+    rm -f /pgtest-regress/pg_regress.c /pgtest-regress/pg_regress.h \
+          /pgtest-regress/pg_regress_main.c /pgtest-regress/GNUmakefile \
+          /pgtest-regress/Makefile /pgtest-regress/meson.build
+
+# The `triggers` test loads two support modules from `--dlpath` as well, which
+# `make check` builds from contrib/spi. The image already ships them.
+RUN cp "$(pg_config --pkglibdir)/autoinc.so" \
+       "$(pg_config --pkglibdir)/refint.so" \
+       /pgtest-regress/
+
+COPY run-regress.sh /usr/local/bin/run-regress.sh
+RUN chmod +x /usr/local/bin/run-regress.sh

@@ -1,0 +1,231 @@
+//! Socket plumbing: a small enum over TCP and Unix streams, plus helpers to
+//! upgrade either kind to TLS and to read Unix peer credentials.
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::BytesMut;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpStream, UnixStream};
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use crate::error::{Error, Result};
+use crate::protocol::startup::ssl_request_bytes;
+use crate::proxy::config::{Endpoint, TlsClientOptions};
+
+/// Anything that can carry a PostgreSQL stream.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> AsyncReadWrite for T {}
+
+/// A boxed, type-erased bidirectional stream.
+pub type BoxedStream = Box<dyn AsyncReadWrite>;
+
+/// A freshly accepted or freshly connected stream, before any TLS decision.
+#[derive(Debug)]
+pub enum RawStream {
+    /// Plain TCP.
+    Tcp(TcpStream),
+    /// Plain Unix-domain socket.
+    Unix(UnixStream),
+}
+
+impl RawStream {
+    /// Connect to an upstream endpoint.
+    pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
+        match endpoint {
+            Endpoint::Tcp { host, port } => {
+                let stream = TcpStream::connect((host.as_str(), *port))
+                    .await
+                    .map_err(|e| {
+                        Error::other(format!("cannot connect to upstream {host}:{port}: {e}"))
+                    })?;
+                // Latency matters for a proxy; never delay small protocol messages.
+                let _ = stream.set_nodelay(true);
+                Ok(RawStream::Tcp(stream))
+            }
+            Endpoint::Unix { path } => {
+                let stream = UnixStream::connect(path).await.map_err(|e| {
+                    Error::other(format!(
+                        "cannot connect to upstream socket {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                Ok(RawStream::Unix(stream))
+            }
+        }
+    }
+
+    /// Peer credentials for a Unix socket, when the platform provides them.
+    pub fn unix_peer_cred(&self) -> Option<(i32, u32, u32)> {
+        match self {
+            RawStream::Unix(s) => unix_peer_cred(s),
+            RawStream::Tcp(_) => None,
+        }
+    }
+
+    /// Send an `SSLRequest` and read the server's single-byte answer.
+    ///
+    /// Returns `true` when the server agreed to a TLS handshake (answered `S`).
+    pub async fn ssl_request(&mut self) -> Result<bool> {
+        self.write_all(&ssl_request_bytes()).await?;
+        self.flush().await?;
+        let mut answer = [0u8; 1];
+        self.read_exact(&mut answer).await.map_err(|e| {
+            Error::other(format!(
+                "upstream closed the connection during TLS negotiation: {e}"
+            ))
+        })?;
+        match answer[0] {
+            b'S' => Ok(true),
+            b'N' => Ok(false),
+            other => Err(Error::protocol(format!(
+                "unexpected response to SSLRequest: 0x{other:02x}"
+            ))),
+        }
+    }
+
+    /// Perform the *client* side of a TLS handshake, after a successful
+    /// [`RawStream::ssl_request`].
+    pub async fn start_tls_client(
+        self,
+        host: &str,
+        options: &TlsClientOptions,
+    ) -> Result<BoxedStream> {
+        let config = crate::proxy::tls::client_config(options)?;
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| Error::tls(format!("invalid server name {host:?}: {e}")))?;
+        let connector = TlsConnector::from(config);
+        let stream: BoxedStream = match self {
+            RawStream::Tcp(s) => Box::new(connector.connect(server_name, s).await?),
+            RawStream::Unix(s) => Box::new(connector.connect(server_name, s).await?),
+        };
+        Ok(stream)
+    }
+
+    /// Perform the *server* side of a TLS handshake.
+    pub async fn upgrade_to_tls_server(
+        self,
+        acceptor: TlsAcceptor,
+    ) -> Result<ServerTlsStream<RawStream>> {
+        let stream = acceptor.accept(self).await?;
+        Ok(stream)
+    }
+}
+
+impl AsyncRead for RawStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            RawStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            RawStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RawStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            RawStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            RawStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            RawStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            RawStream::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            RawStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            RawStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Box a raw stream.
+pub fn boxed<T: AsyncReadWrite + 'static>(stream: T) -> BoxedStream {
+    Box::new(stream)
+}
+
+/// Read Unix peer credentials via `SO_PEERCRED` (Linux) or `getpeereid` (BSD).
+#[cfg(unix)]
+pub fn unix_peer_cred(stream: &UnixStream) -> Option<(i32, u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` is a properly sized, initialized buffer for SO_PEERCRED.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut libc::ucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Some((cred.pid, cred.uid, cred.gid))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: both pointers are valid out-parameters for getpeereid.
+        let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        if rc == 0 {
+            Some((-1, uid, gid))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn unix_peer_cred(_stream: &UnixStream) -> Option<(i32, u32, u32)> {
+    None
+}
+
+/// Fill `buf` with one more chunk of data from `stream`.
+///
+/// Returns the number of bytes read; zero means end of stream.
+pub async fn fill(stream: &mut BoxedStream, buf: &mut BytesMut) -> Result<usize> {
+    buf.reserve(16 * 1024);
+    let n = stream.read_buf(buf).await?;
+    Ok(n)
+}
+
+/// Fail when a buffer still holds bytes that belonged to the previous protocol
+/// phase (for example, data sent before a TLS handshake completed).
+pub fn expect_empty(buf: &BytesMut, what: &str) -> Result<()> {
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::protocol(format!(
+            "unexpected {} bytes of trailing data {what}",
+            buf.len()
+        )))
+    }
+}

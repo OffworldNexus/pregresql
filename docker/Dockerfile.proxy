@@ -1,0 +1,22 @@
+# Build the demo proxy in a throwaway Rust image and ship just the binary.
+FROM rust:1.99-slim-trixie AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --bin pregresql-proxy
+
+FROM debian:trixie-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates openssl \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/pregresql-proxy /usr/local/bin/pregresql-proxy
+
+# A throwaway self-signed certificate so that the validation stack can exercise
+# the client-facing TLS path. Real deployments mount a real certificate.
+RUN mkdir -p /etc/pregresql \
+ && openssl req -new -x509 -days 3650 -nodes \
+        -out /etc/pregresql/server.crt \
+        -keyout /etc/pregresql/server.key \
+        -subj "/CN=pregresql-proxy" >/dev/null 2>&1
+
+ENTRYPOINT ["/usr/local/bin/pregresql-proxy"]
