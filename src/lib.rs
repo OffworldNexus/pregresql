@@ -28,7 +28,7 @@ pub use error::{Error, Result};
 pub use proxy::{
     AuthContext, AuthError, AuthHook, ClientAuthMethod, Endpoint, InboundConnection, Proxy,
     ProxyConfig, QueryContext, QueryDecision, QueryHook, QueryKind, TlsInfo, Transport,
-    UpstreamTarget, UpstreamTls, VerifyMode,
+    UnixCredentials, UpstreamTarget, UpstreamTls, VerifyMode,
 };
 
 /// The protocol version implemented by this crate (3.0).

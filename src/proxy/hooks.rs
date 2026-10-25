@@ -6,25 +6,52 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::proxy::config::UpstreamTls;
 
+/// Process credentials of a Unix-domain socket peer, as attached by the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnixCredentials {
+    /// Process id of the sender.
+    pub pid: i32,
+    /// User id of the sender.
+    pub uid: u32,
+    /// Group id of the sender.
+    pub gid: u32,
+}
+
 /// Where an inbound connection came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    /// A Unix-domain socket. Peer credentials come from `SO_PEERCRED`.
+    /// A Unix-domain socket.
+    ///
+    /// Two independent sources of peer credentials are recorded:
+    ///
+    /// * `peer_pid`/`peer_uid`/`peer_gid` come from `SO_PEERCRED` (Linux) or
+    ///   `getpeereid` (BSD/macOS, where there is no pid and `peer_pid` is
+    ///   `Some(-1)`). They are **unreliable under gVisor** (for example on
+    ///   DigitalOcean App Platform), which reports the *listener's* own
+    ///   credentials for every accepted connection.
+    /// * `message_credentials` is the `SCM_CREDENTIALS` the kernel attached to
+    ///   the first message the client sent, read with `SO_PASSCRED`. See
+    ///   [`Transport::message_credentials`].
     Unix {
-        /// Path the proxy is listening on.
+        /// Path the proxy is listening on (empty for unnamed sockets).
         path: PathBuf,
-        /// Peer process id, when the platform exposes it.
+        /// Peer process id from `SO_PEERCRED`, when the platform exposes it.
         peer_pid: Option<i32>,
-        /// Peer user id.
+        /// Peer user id from `SO_PEERCRED`/`getpeereid`.
         peer_uid: Option<u32>,
-        /// Peer group id.
+        /// Peer group id from `SO_PEERCRED`/`getpeereid`.
         peer_gid: Option<u32>,
+        /// Kernel-attached credentials of the client's first message
+        /// (`SCM_CREDENTIALS`). Only available on Linux and Android; `None`
+        /// elsewhere, or when the proxy could not enable `SO_PASSCRED`.
+        message_credentials: Option<UnixCredentials>,
     },
     /// A TCP socket.
     Tcp {
@@ -41,12 +68,41 @@ impl Transport {
         matches!(self, Transport::Unix { .. })
     }
 
-    /// The peer's uid, when known.
+    /// The peer's uid according to `SO_PEERCRED`/`getpeereid`, when known.
+    ///
+    /// Under gVisor this is the uid of the *listening* process, not of the
+    /// client; prefer [`Transport::message_uid`] where it is available.
     pub fn peer_uid(&self) -> Option<u32> {
         match self {
             Transport::Unix { peer_uid, .. } => *peer_uid,
             Transport::Tcp { .. } => None,
         }
+    }
+
+    /// The `SCM_CREDENTIALS` the kernel attached to the first message the
+    /// client sent over a Unix-domain socket (Linux and Android only).
+    ///
+    /// The client does not have to do anything for this: when the receiving
+    /// socket has `SO_PASSCRED` set, the kernel attaches the sending process's
+    /// pid, uid and gid to every message, and a sender can only claim other
+    /// credentials explicitly if it has the privilege to (`CAP_SYS_ADMIN`,
+    /// `CAP_SETUID`, `CAP_SETGID`). These are the credentials of whichever
+    /// process wrote the first bytes of the connection (normally the client
+    /// itself; the socket could have been handed to another process
+    /// afterwards).
+    pub fn message_credentials(&self) -> Option<UnixCredentials> {
+        match self {
+            Transport::Unix {
+                message_credentials,
+                ..
+            } => *message_credentials,
+            Transport::Tcp { .. } => None,
+        }
+    }
+
+    /// The uid from [`Transport::message_credentials`], when known.
+    pub fn message_uid(&self) -> Option<u32> {
+        self.message_credentials().map(|c| c.uid)
     }
 }
 
@@ -72,9 +128,22 @@ pub struct InboundConnection {
     pub protocol_version: i32,
     /// The startup parameters, in wire order.
     pub params: Vec<(String, String)>,
+    /// The tag of the listener that accepted the connection, for listeners
+    /// handed to the proxy with [`Proxy::add_unix_listener`] or
+    /// [`Proxy::add_tcp_listener`]. `None` for listeners from
+    /// [`ProxyConfig::listen`](crate::proxy::ProxyConfig::listen).
+    ///
+    /// [`Proxy::add_unix_listener`]: crate::proxy::Proxy::add_unix_listener
+    /// [`Proxy::add_tcp_listener`]: crate::proxy::Proxy::add_tcp_listener
+    pub listener_tag: Option<Arc<str>>,
 }
 
 impl InboundConnection {
+    /// The tag of the listener that accepted the connection, if any.
+    pub fn listener_tag(&self) -> Option<&str> {
+        self.listener_tag.as_deref()
+    }
+
     /// The `user` startup parameter.
     pub fn user(&self) -> Option<&str> {
         self.param("user")
@@ -286,6 +355,10 @@ impl QueryKind {
 pub struct QueryContext<'a> {
     /// The connection id, as in [`InboundConnection::id`].
     pub connection_id: u64,
+    /// Everything observed about the inbound connection when it was set up
+    /// (transport, credentials, listener tag, TLS state, startup packet). This
+    /// is the same value the [`AuthHook`] saw.
+    pub connection: &'a InboundConnection,
     /// The user the client logged in as (to the proxy).
     pub user: &'a str,
     /// The user the proxy logged in as (to the upstream server).

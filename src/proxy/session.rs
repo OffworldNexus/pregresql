@@ -168,7 +168,7 @@ impl Shared {
 
 /// Static context for the client-side pump.
 struct ClientPump {
-    connection_id: u64,
+    connection: Arc<InboundConnection>,
     user: String,
     upstream_user: String,
     hook: Arc<dyn QueryHook>,
@@ -249,6 +249,8 @@ pub struct Session {
     pub startup: StartupParams,
     /// Where the client connected from.
     pub transport: Transport,
+    /// Tag of the listener that accepted the connection, if it had one.
+    pub listener_tag: Option<Arc<str>>,
     /// TLS properties of the inbound connection.
     pub tls: TlsInfo,
     /// The authentication hook.
@@ -271,6 +273,8 @@ pub struct Session {
     scram: Option<Box<ScramClient>>,
     /// The role the proxy uses towards the upstream server.
     upstream_user: String,
+    /// What the hooks are told about this connection, built once.
+    inbound: Arc<InboundConnection>,
 }
 
 impl Session {
@@ -282,6 +286,7 @@ impl Session {
         client_buf: BytesMut,
         startup: StartupParams,
         transport: Transport,
+        listener_tag: Option<Arc<str>>,
         tls: TlsInfo,
         auth: Arc<dyn crate::proxy::hooks::AuthHook>,
         query: Arc<dyn QueryHook>,
@@ -290,12 +295,21 @@ impl Session {
         our_pid: i32,
         our_secret: i32,
     ) -> Self {
+        let inbound = Arc::new(InboundConnection {
+            id,
+            transport: transport.clone(),
+            tls: tls.clone(),
+            protocol_version: startup.version,
+            params: startup.params.clone(),
+            listener_tag: listener_tag.clone(),
+        });
         Self {
             id,
             client,
             client_buf,
             startup,
             transport,
+            listener_tag,
             tls,
             auth,
             query,
@@ -307,6 +321,7 @@ impl Session {
             upstream: None,
             scram: None,
             upstream_user: String::new(),
+            inbound,
         }
     }
 
@@ -341,12 +356,12 @@ impl Session {
         }
 
         // 2. Authenticate the client against the proxy.
-        let method = self.auth.client_auth_method(&self.inbound());
+        let inbound = Arc::clone(&self.inbound);
+        let method = self.auth.client_auth_method(&inbound);
         let identity = self.authenticate_client(method).await?;
 
         // 3. Ask the hook where this session should go.
         let user = self.user().to_string();
-        let inbound = self.inbound();
         let ctx = AuthContext {
             connection: &inbound,
             user: &user,
@@ -413,14 +428,9 @@ impl Session {
         Ok(())
     }
 
-    fn inbound(&self) -> InboundConnection {
-        InboundConnection {
-            id: self.id,
-            transport: self.transport.clone(),
-            tls: self.tls.clone(),
-            protocol_version: self.startup.version,
-            params: self.startup.params.clone(),
-        }
+    /// What the hooks are told about this connection.
+    pub fn inbound(&self) -> &Arc<InboundConnection> {
+        &self.inbound
     }
 
     fn user(&self) -> &str {
@@ -474,7 +484,7 @@ impl Session {
 
     async fn authenticate_client(&mut self, method: ClientAuthMethod) -> Result<ClientIdentity> {
         let user = self.user().to_string();
-        let inbound = self.inbound();
+        let inbound = Arc::clone(&self.inbound);
         let expected = self.auth.password_for_user(&inbound, &user);
 
         match method {
@@ -847,7 +857,7 @@ impl Session {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let max_len = self.max_message_length;
         let pump = ClientPump {
-            connection_id: self.id,
+            connection: Arc::clone(&self.inbound),
             user: self.user().to_string(),
             upstream_user: self.upstream_user.clone(),
             hook: self.query.clone(),
@@ -1332,7 +1342,8 @@ async fn authorize(
 ) -> QueryDecision {
     let transaction_status = current_status(shared);
     let query_ctx = QueryContext {
-        connection_id: ctx.connection_id,
+        connection_id: ctx.connection.id,
+        connection: &ctx.connection,
         user: &ctx.user,
         upstream_user: &ctx.upstream_user,
         transaction_status,
