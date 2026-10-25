@@ -1,0 +1,39 @@
+# Dependency policy for `cargo deny check` (also enforced in CI).
+#
+# The crate ships a proxy that terminates other people's database credentials,
+# so the bar for what goes into the build graph is deliberately explicit.
+
+[advisories]
+# Nothing is ignored today. If an advisory ever needs an ignore, it has to come
+# with a comment saying which crate pulls it in, why there is no upgrade to
+# take, and what would let us remove the ignore.
+
+[licenses]
+# Everything reachable from this crate must be permissively licensed. The list
+# is exactly what the resolved graph uses — see the comment on each entry for
+# which dependency brings it in — so adding a dependency with a new licence is a
+# deliberate decision rather than a silent one.
+allow = [
+    "Apache-2.0",   # the crate itself; tokio, rustls, clap, sha2, …
+    "MIT",          # bytes, rand, hex, base64, stringprep, thiserror, …
+    "ISC",          # ring, untrusted
+    "BSD-3-Clause", # the `subtle`/`webpki` family
+    "Unicode-3.0",  # unicode-ident, unicode-normalization (via stringprep)
+    "Zlib",         # foldhash and friends
+]
+confidence-threshold = 0.8
+
+[bans]
+# Two versions of a crate reachable at once is a smell but not a defect, and the
+# crypto stack genuinely moves in lockstep: `tokio-postgres` (a test-only
+# dependency) still builds on the RustCrypto 0.10 generation while this crate
+# uses it directly too.
+multiple-versions = "warn"
+# No wildcard requirements anywhere: the proxy is deployed as a lockfile build.
+wildcards = "deny"
+
+[sources]
+# Only crates.io. A proxy is not the place for code of unknown provenance.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

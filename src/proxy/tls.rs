@@ -1,11 +1,10 @@
 //! TLS support: serving TLS to clients and speaking TLS to the upstream server.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 
@@ -17,12 +16,16 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// Load a PEM certificate chain.
+///
+/// Parses with `rustls-pki-types`' own PEM support rather than the archived
+/// `rustls-pemfile` crate, which `cargo deny` reports as unmaintained
+/// (RUSTSEC-2025-0134).
 pub fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).map_err(|e| Error::tls(format!("cannot open {}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-    let certs: std::result::Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| Error::tls(format!("cannot parse {}: {e}", path.display())))?;
+    let sections = CertificateDer::pem_file_iter(path)
+        .map_err(|e| Error::tls(format!("cannot read {}: {e}", path.display())))?;
+    let certs = sections
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::tls(format!("cannot parse {}: {e}", path.display())))?;
     if certs.is_empty() {
         return Err(Error::tls(format!(
             "{} does not contain any certificate",
@@ -34,12 +37,12 @@ pub fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
 /// Load a PEM private key (PKCS#8, PKCS#1 or SEC1).
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        File::open(path).map_err(|e| Error::tls(format!("cannot open {}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| Error::tls(format!("cannot parse {}: {e}", path.display())))?
-        .ok_or_else(|| Error::tls(format!("{} does not contain a private key", path.display())))
+    PrivateKeyDer::from_pem_file(path).map_err(|e| {
+        Error::tls(format!(
+            "cannot read a private key from {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// Build a server configuration, optionally requiring client certificates.

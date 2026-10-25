@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  # Every ticket gets its own `feature/<linear-id>-…` branch, so those are
+  # first-class CI targets alongside the integration branch, `develop`.
+  push:
+    branches: [develop, "feature/**"]
+  pull_request:
+    branches: [develop]
+
+# One concurrent run per branch; never cancel a run already in progress on
+# `develop`.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/develop' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy + doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      # The crate has no feature matrix yet, so `--all-targets` covers the
+      # library, the demo binary, the demo client example and every test.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      # Documentation is part of the public surface of a protocol crate: a
+      # broken intra-doc link or a stale code sample is a defect.
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Unix only, on purpose: the crate speaks the protocol over TCP *and*
+        # over Unix-domain sockets, and reads peer credentials through
+        # `SO_PEERCRED` (Linux) or `getpeereid` (BSD/macOS). macOS is in the
+        # matrix so that the non-Linux credentials path is compiled and run
+        # somewhere real.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build all targets
+        run: cargo build --all-targets --locked
+      - name: Run unit and integration tests
+        run: cargo test --all-targets --locked
+      # `--all-targets` does not include doctests, and the crate documents its
+      # entry point with a runnable example.
+      - name: Run doc tests
+        run: cargo test --doc --locked
+
+  # The declared floor, `rust-version` in Cargo.toml. The published artefact is
+  # a container built with a current toolchain, so nothing else would notice a
+  # dependency bump that quietly raised the floor. `--all-targets` is what makes
+  # this meaningful: the floor covers the test-only dependencies too.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV build
+        env:
+          RUSTUP_TOOLCHAIN: 1.88.0
+        run: cargo check --all-targets --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # The project's actual guarantee: the official PostgreSQL regression suite,
+  # run twice with an identical client environment — once against the server
+  # directly and once through the proxy — must produce identical results, and
+  # the locked-down demo client must behave. See scripts/validate.sh.
+  validation:
+    name: end-to-end (docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The harness needs to pull two base images and build a PostgreSQL test
+      # image; `docker compose` and `docker build` are both present on the
+      # GitHub runner.
+      - name: Show docker versions
+        run: |
+          docker --version
+          docker compose version
+      - name: Run the official regression suite and the demo client
+        run: ./scripts/validate.sh
+      - name: Upload the regression logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results
+          path: |
+            docker/results/tester.log
+            docker/results/**/pg_regress.stdout
+            docker/results/*.diff
+          if-no-files-found: warn

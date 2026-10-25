@@ -1,5 +1,8 @@
 # pregresql
 
+[![CI](https://github.com/OffworldNexus/pregresql/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/OffworldNexus/pregresql/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A mostly-transparent proxy for the PostgreSQL frontend/backend protocol, written
 in pure Rust, with two hooks:
 
@@ -41,6 +44,16 @@ own `psql`).
 | `examples/demo_client.rs` | a driver client that demonstrates the locked-down proxy |
 | `docker/` | PostgreSQL + proxy + official regression suite harness |
 | `scripts/validate.sh` | one command that runs the whole validation |
+
+## Requirements
+
+Unix-like operating system (Linux, or BSD/macOS). The proxy speaks the protocol
+over TCP *and* over Unix-domain sockets, and reads peer credentials through
+`SO_PEERCRED` (Linux) or `getpeereid` (BSD/macOS); `tokio`'s Unix-socket types
+are not available on Windows. CI therefore runs on Linux and macOS.
+
+Rust 1.88 or newer (the floor is set by the resolved dependency graph; it is
+checked in CI).
 
 ## Library use
 
@@ -306,11 +319,32 @@ Known, deliberate limitations:
 ## Testing
 
 ```console
-$ cargo test          # unit tests, including the RFC 7677 SCRAM vector
-$ cargo clippy --all-targets
+$ cargo test --all-targets --locked   # unit and integration tests
+$ cargo test --doc --locked           # the doc examples
+$ cargo fmt --all -- --check
+$ cargo clippy --all-targets -- -D warnings
+$ cargo deny check
+$ ./scripts/validate.sh               # the docker end-to-end validation
 ```
 
 Unit tests cover framing (including truncated prefixes), startup packet
 round-trips, MD5 composition, the SCRAM client/server exchange in both
 directions against the published RFC 7677 test vector, error-field encoding, and
 the output-ordering rules for rejections.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `develop` or a `feature/**`
+branch and on every pull request into `develop`:
+
+| Job | What it enforces |
+| --- | --- |
+| `lint` | `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo doc` with `RUSTDOCFLAGS=-D warnings` (a broken intra-doc link in a protocol crate is a defect) |
+| `test` | build and test on Linux and macOS — macOS so that the non-Linux `getpeereid` credentials path is compiled and run somewhere real |
+| `msrv` | the declared `rust-version` floor, `cargo check --all-targets --locked` on 1.88.0 |
+| `deny` | `cargo deny check` against `deny.toml`: advisory, licence, duplicate-source and wildcard policy |
+| `validation` | `scripts/validate.sh`: the official PostgreSQL regression suite run twice (direct and through the proxy) with identical environments, the TLS check, and the locked-down demo client — the project's actual guarantee |
+
+`deny.toml` is not decorative: it is what surfaced that `rustls-pemfile` is
+unmaintained (RUSTSEC-2025-0134), which is why certificate and key loading goes
+through `rustls-pki-types`' own PEM support instead.

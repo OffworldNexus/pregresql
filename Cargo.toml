@@ -2,9 +2,12 @@
 name = "pregresql"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.88"
 description = "A mostly-transparent PostgreSQL wire-protocol proxy with pluggable authentication and query policy hooks"
 license = "Apache-2.0"
+repository = "https://github.com/OffworldNexus/pregresql"
+keywords = ["postgresql", "proxy", "protocol", "scram", "database"]
+categories = ["database", "network-programming"]
 publish = false
 
 [lib]
@@ -26,7 +29,6 @@ md-5 = "0.10"
 pbkdf2 = "0.12"
 rand = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
 sha2 = "0.10"
 stringprep = "0.1"
 thiserror = "2"
